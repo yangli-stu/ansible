@@ -18,6 +18,7 @@ DOCUMENTATION = '''
 '''
 
 import os
+import requests
 import time
 import json
 
@@ -26,7 +27,7 @@ from ansible.module_utils._text import to_bytes
 from ansible.module_utils.common._collections_compat import MutableMapping
 from ansible.parsing.ajson import AnsibleJSONEncoder
 from ansible.plugins.callback import CallbackBase
-
+from ansible.errors import AnsibleError
 
 # NOTE: in Ansible 1.2 or later general logging is available without
 # this plugin, just set ANSIBLE_LOG_PATH as an environment variable
@@ -34,6 +35,10 @@ from ansible.plugins.callback import CallbackBase
 # file.  This callback is an example of per hosts logging for those
 # that want it.
 
+try:
+    import requests
+except ImportError:
+    raise AnsibleError("can not find module of requests")
 
 class CallbackModule(CallbackBase):
 
@@ -46,23 +51,64 @@ class CallbackModule(CallbackBase):
     MSG_FORMAT = "%(now)s - %(category)s - %(data)s\n\n"
 
     def __init__(self):
-        self.error_result = {}
+        # init vars of kc need, and used in on playbook end.
+        self.playbook_error_result = {}
         self.playbook_progress = {}
-        self.playbook_progress['start_host'] = {}
-        self.playbook_progress['end_host'] = {}
+        self.playbook_progress['start_host'] = []
+        self.playbook_progress['end_host'] = []
 
         super(CallbackModule, self).__init__()
-
-    def v2_playbook_on_play_start(self, play):
-        self.variable_manager = play.get_variable_manager()
 
     def set_options(self, task_keys=None, var_options=None, direct=None):
         super(CallbackModule, self).set_options(task_keys=task_keys, var_options=var_options, direct=direct)
 
-        self.log_folder = "/opt/kyligence_cloud/test/log"
+    def v2_playbook_on_play_start(self, play):
+        self.variable_manager = play.get_variable_manager()
 
-        if not os.path.exists(self.log_folder):
-            makedirs_safe(self.log_folder)
+    def runner_on_failed(self, host, res, ignore_errors=False):
+        self.playbook_error_result[host] = {}
+        self.playbook_error_result[host]['FAILED'] = self.filter_res(res)
+        # self.log(host, 'FAILED', res)
+
+    def runner_on_unreachable(self, host, res):
+        self.playbook_error_result[host] = {}
+        self.playbook_error_result[host]['UNREACHABLE'] = self.filter_res(res)
+        # self.log(host, 'UNREACHABLE', res)
+
+    def playbook_on_stats(self, stats):
+        self.my_log(self.playbook_error_result)
+        self.send_kc_request(self.playbook_error_result)
+
+    def send_kc_request(self, jsonMsg):
+        url = 'http://localhost:8087/api/ansible_plugin/callback/kc_operation_log'
+        header_dict = {
+            'Content-Type': 'application/json;charset=utf-8'
+        }
+        data_dict = {
+            'operationLogId': "1234",
+            'msg': jsonMsg
+        }
+        res = requests.put(url=url, headers=header_dict, data=json.dumps(data_dict))
+        self.my_log(res)
+
+    def filter_res(self, res):
+        # TODO: filter
+        res.pop('stdout_lines')
+        res.pop('stderr_lines')
+        res.pop('_ansible_no_log')
+        return res
+
+    def my_log(self, my_msg):
+        my_path = "/opt/kyligence_cloud/test"
+        path = os.path.join(my_path, "log_file")
+        now = time.strftime(self.TIME_FORMAT, time.localtime())
+        if not os.path.exists(my_path):
+            makedirs_safe(my_path)
+
+        msg = to_bytes("%(now)s ==> my_msg: %(data)s\n\n" % dict(now=now, data=my_msg))
+
+        with open(path, "ab") as fd:
+            fd.write(msg)
 
     def log(self, host, category, data):
         host_vars = self.variable_manager.get_vars()['hostvars'][host]
@@ -91,24 +137,3 @@ class CallbackModule(CallbackBase):
         with open(path, "ab") as fd:
             fd.write(msg)
 
-
-    def runner_on_failed(self, host, res, ignore_errors=False):
-        self.log(host, 'FAILED', res)
-
-    def runner_on_ok(self, host, res):
-        self.log(host, 'OK', res)
-
-    def runner_on_skipped(self, host, item=None):
-        self.log(host, 'SKIPPED', '...')
-
-    def runner_on_unreachable(self, host, res):
-        self.log(host, 'UNREACHABLE', res)
-
-    def runner_on_async_failed(self, host, res, jid):
-        self.log(host, 'ASYNC_FAILED', res)
-
-    def playbook_on_import_for_host(self, host, imported_file):
-        self.log(host, 'IMPORTED', imported_file)
-
-    def playbook_on_not_import_for_host(self, host, missing_file):
-        self.log(host, 'NOTIMPORTED', missing_file)
