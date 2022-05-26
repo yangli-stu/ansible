@@ -52,7 +52,7 @@ class CallbackModule(CallbackBase):
         'Accept': 'application/vnd.apache.kylin-v4+json',
         'Accept-Language': 'en',
         'Content-Type': 'application/json;charset=utf-8',
-        'Authorization': 'Basic QURNSU46ViE2ajVQZkZ1SG1XWnVtRmU='
+        'Authorization': ''
     }
     ## Filter the specified field in the result log.
     FILTER_LOG_FIELD = ['stdout_lines', 'stderr_lines', '_ansible_no_log', 'exception', 'invocation']
