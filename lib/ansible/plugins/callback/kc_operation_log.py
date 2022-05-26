@@ -14,7 +14,7 @@ DOCUMENTATION = '''
       - This callback writes playbook output to kc api
     requirements:
      - Whitelist in configuration
-     - some config in inventory vars, such as kc api, header, operationLogId
+     - definition operation_log_uuid in inventory vars
 '''
 
 import os
@@ -24,8 +24,6 @@ import json
 
 from ansible.utils.path import makedirs_safe
 from ansible.module_utils._text import to_bytes
-from ansible.module_utils.common._collections_compat import MutableMapping
-from ansible.parsing.ajson import AnsibleJSONEncoder
 from ansible.plugins.callback import CallbackBase
 from ansible.errors import AnsibleError
 
@@ -46,13 +44,22 @@ class CallbackModule(CallbackBase):
     CALLBACK_TYPE = 'notification'
     CALLBACK_NAME = 'kc_operation_log'
     CALLBACK_NEEDS_WHITELIST = True
-
     TIME_FORMAT = "%b %d %Y %H:%M:%S"
-    MSG_FORMAT = "%(now)s - %(category)s - %(data)s\n\n"
+
+    ## KC callback api config
+    REQUEST_URI = 'http://localhost:8087/api/ansible_plugin/callback/kc_operation_log'
+    REQUEST_HEADER = {
+        'Accept': 'application/vnd.apache.kylin-v4+json',
+        'Accept-Language': 'en',
+        'Content-Type': 'application/json;charset=utf-8',
+        'Authorization': 'Basic QURNSU46ViE2ajVQZkZ1SG1XWnVtRmU='
+    }
+    ## Filter the specified field in the result log.
+    FILTER_LOG_FIELD = ['stdout_lines', 'stderr_lines', '_ansible_no_log', 'exception', 'invocation']
 
     def __init__(self):
         # init vars of kc need, and used in on playbook end.
-        self.playbook_error_result = {}
+        self.playbook_failed_result = {}
         self.playbook_progress = {}
         self.playbook_progress['start_host'] = []
         self.playbook_progress['end_host'] = []
@@ -65,75 +72,54 @@ class CallbackModule(CallbackBase):
     def v2_playbook_on_play_start(self, play):
         self.variable_manager = play.get_variable_manager()
 
-    def runner_on_failed(self, host, res, ignore_errors=False):
-        self.playbook_error_result[host] = {}
-        self.playbook_error_result[host]['FAILED'] = self.filter_res(res)
-        # self.log(host, 'FAILED', res)
+    def runner_on_failed(self, host, res, ignore_errors=True):
+        ## init a result list of failed
+        if host not in self.playbook_failed_result:
+            self.playbook_failed_result[host] = {}
+        if 'FAILED' not in self.playbook_failed_result[host]:
+            self.playbook_failed_result[host]['FAILED'] = []
+
+        self.playbook_failed_result[host]['FAILED'].append(self.filter_res(res))
 
     def runner_on_unreachable(self, host, res):
-        self.playbook_error_result[host] = {}
-        self.playbook_error_result[host]['UNREACHABLE'] = self.filter_res(res)
-        # self.log(host, 'UNREACHABLE', res)
+        ## init a result list of unreachable
+        if host not in self.playbook_failed_result:
+            self.playbook_failed_result[host] = {}
+        if 'UNREACHABLE' not in self.playbook_failed_result[host]:
+            self.playbook_failed_result[host]['UNREACHABLE'] = []
+
+        self.playbook_failed_result[host]['UNREACHABLE'].append(self.filter_res(res))
 
     def playbook_on_stats(self, stats):
-        self.my_log(self.playbook_error_result)
-        self.send_kc_request(self.playbook_error_result)
+        if self.playbook_failed_result:
+            host_1 = list(stats.processed.keys())[0]
+            self.operation_log_uuid = self.variable_manager.get_vars()['hostvars'][host_1]['operation_log_uuid']
+            self.my_debug_log('playbook_on_stats: operationLogId ===> ' + self.operation_log_uuid)
+            self.my_debug_log('playbook_on_stats: playbook_failed_result ===> ' + str(self.playbook_failed_result))
 
-    def send_kc_request(self, jsonMsg):
-        url = 'http://localhost:8087/api/ansible_plugin/callback/kc_operation_log'
-        header_dict = {
-            'Content-Type': 'application/json;charset=utf-8'
-        }
+            self.send_callback_request(self.playbook_failed_result)
+
+    def send_callback_request(self, jsonMsg):
         data_dict = {
-            'operationLogId': "1234",
-            'msg': jsonMsg
+            "operationLogUuid": str(self.operation_log_uuid),
+            "failedMessage": jsonMsg
         }
-        res = requests.put(url=url, headers=header_dict, data=json.dumps(data_dict))
-        self.my_log(res)
+        res = requests.post(url=self.REQUEST_URI, headers=self.REQUEST_HEADER, data=json.dumps(data_dict))
+        self.my_debug_log('send_callback_request: res ===>' + str(res))
 
     def filter_res(self, res):
-        # TODO: filter
-        res.pop('stdout_lines')
-        res.pop('stderr_lines')
-        res.pop('_ansible_no_log')
+        for key in self.FILTER_LOG_FIELD:
+            if key in res:
+                res.pop(key)
         return res
 
-    def my_log(self, my_msg):
-        my_path = "/opt/kyligence_cloud/test"
-        path = os.path.join(my_path, "log_file")
+    def my_debug_log(self, my_msg):
+        debug_path = "/opt/kyligence_cloud/test"
+        path = os.path.join(debug_path, "kc_operation_log-debug.log")
         now = time.strftime(self.TIME_FORMAT, time.localtime())
-        if not os.path.exists(my_path):
-            makedirs_safe(my_path)
-
-        msg = to_bytes("%(now)s ==> my_msg: %(data)s\n\n" % dict(now=now, data=my_msg))
+        if not os.path.exists(debug_path):
+            makedirs_safe(debug_path)
+        msg = to_bytes("%(now)s DEBUG ==> kc_operation_log: %(data)s\n\n" % dict(now=now, data=my_msg))
 
         with open(path, "ab") as fd:
             fd.write(msg)
-
-    def log(self, host, category, data):
-        host_vars = self.variable_manager.get_vars()['hostvars'][host]
-
-        self.log_folder = host_vars['log_path']
-        if not os.path.exists(self.log_folder):
-            makedirs_safe(self.log_folder)
-
-        var_that_i_want = host_vars['ssh_user']
-
-        if isinstance(data, MutableMapping):
-            if '_ansible_verbose_override' in data:
-                # avoid logging extraneous data
-                data = 'omitted'
-            else:
-                data = data.copy()
-                invocation = data.pop('invocation', None)
-                data = json.dumps(data, cls=AnsibleJSONEncoder)
-                if invocation is not None:
-                    data = json.dumps(invocation) + " bowen_test_log [%s] => %s " % (var_that_i_want, data)
-
-        path = os.path.join(self.log_folder, host)
-        now = time.strftime(self.TIME_FORMAT, time.localtime())
-
-        msg = to_bytes(self.MSG_FORMAT % dict(now=now, category=category, data=data))
-        with open(path, "ab") as fd:
-            fd.write(msg)
-
